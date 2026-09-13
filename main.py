@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import re
 import uuid
 
@@ -327,6 +328,216 @@ def artist_keyboard(
     return InlineKeyboardMarkup(
         inline_keyboard=buttons
     )
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ ДАННЫХ ПО ССЫЛКЕ
+# ============================================================
+
+def format_duration(seconds):
+    try:
+        seconds = int(seconds or 0)
+    except (TypeError, ValueError):
+        return "—"
+
+    if seconds <= 0:
+        return "—"
+
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+    return f"{minutes}:{seconds:02d}"
+
+
+def extract_url_choices_sync(url: str):
+    """
+    Получает содержимое ИМЕННО переданной ссылки.
+
+    Важное правило:
+    - ссылка на конкретный ролик/трек -> только этот материал;
+    - ссылка на настоящий плейлист -> показываем элементы плейлиста;
+    - название из ссылки не используется для нового поиска.
+    """
+
+    def base_opts(noplaylist: bool):
+        return {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": noplaylist,
+            "extract_flat": True,
+            "playlistend": 20,
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/140.0 Safari/537.36"
+                )
+            },
+        }
+
+    # YouTube-ссылка вида /watch?v=...&list=... всё равно указывает
+    # на конкретный ролик. Убираем только параметр list, чтобы yt-dlp
+    # случайно не переключился на весь плейлист.
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    is_youtube_video = (
+        "youtube.com" in parsed.netloc.lower()
+        and "v" in query
+    ) or (
+        "youtu.be" in parsed.netloc.lower()
+        and bool(parsed.path.strip("/"))
+    )
+
+    exact_url = url
+    if is_youtube_video and "v" in query:
+        clean_query = {k: v for k, v in query.items() if k != "list"}
+        exact_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(clean_query, doseq=True),
+            parsed.fragment,
+        ))
+
+    # Сначала всегда пробуем извлечь ровно один материал.
+    with yt_dlp.YoutubeDL(base_opts(True)) as ydl:
+        exact_info = ydl.extract_info(exact_url, download=False)
+
+    if not exact_info:
+        raise RuntimeError("По ссылке ничего не найдено.")
+
+    # Если это конкретный ролик/трек — возвращаем только его.
+    if not exact_info.get("entries"):
+        return [{
+            "url": exact_info.get("webpage_url") or exact_url,
+            "title": exact_info.get("title") or "Без названия",
+            "artist": (
+                exact_info.get("artist")
+                or exact_info.get("uploader")
+                or exact_info.get("channel")
+                or "Неизвестный исполнитель"
+            ),
+            "duration": exact_info.get("duration"),
+        }]
+
+    # Если пользователь прислал настоящий плейлист, получаем его элементы.
+    with yt_dlp.YoutubeDL(base_opts(False)) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info:
+        raise RuntimeError("Не удалось получить содержимое ссылки.")
+
+    items = []
+    for entry in (info.get("entries") or []):
+        if not entry:
+            continue
+
+        item_url = entry.get("webpage_url") or entry.get("original_url")
+        if not item_url:
+            entry_id = entry.get("id")
+            extractor_key = str(info.get("extractor_key", "")).lower()
+            if entry_id and "youtube" in extractor_key:
+                item_url = f"https://www.youtube.com/watch?v={entry_id}"
+
+        if not item_url:
+            continue
+
+        items.append({
+            "url": item_url,
+            "title": entry.get("title") or "Без названия",
+            "artist": (
+                entry.get("artist")
+                or entry.get("uploader")
+                or entry.get("channel")
+                or "Неизвестный исполнитель"
+            ),
+            "duration": entry.get("duration"),
+        })
+
+    if not items:
+        raise RuntimeError("В этой ссылке не найдено доступных треков.")
+
+    return items
+
+
+async def show_url_choices(status_message: Message, url: str):
+    """Показывает данные, полученные именно из переданной ссылки."""
+
+    try:
+        items = await asyncio.to_thread(
+            extract_url_choices_sync,
+            url,
+        )
+
+        if not items:
+            raise RuntimeError("По ссылке ничего не найдено.")
+
+        # Одна конкретная страница: не ищем оригинал,
+        # а показываем ровно то, что вернул источник по этой URL.
+        if len(items) == 1:
+            item = items[0]
+
+            key = save_callback({
+                "type": "url_download",
+                "url": item["url"],
+                "title": item.get("title", "Без названия"),
+            })
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬇️ Скачать именно это",
+                            callback_data=f"urlpick:{key}",
+                        )
+                    ]
+                ]
+            )
+
+            duration = format_duration(item.get("duration"))
+
+            await status_message.edit_text(
+                "🔗 <b>Получено по твоей ссылке</b>\n\n"
+                f"🎵 <b>{escape(item['title'])}</b>\n"
+                f"👤 {escape(item['artist'])}\n"
+                f"⏱ {escape(duration)}\n\n"
+                "Нажми кнопку — бот скачает именно этот материал, "
+                "не выполняя поиск по названию.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return
+
+        # Если ссылка содержит несколько элементов (например, плейлист),
+        # показываем выбор из реально полученных элементов.
+        lines = [
+            "🔗 <b>По ссылке найдено несколько элементов</b>",
+            "\nВыбери нужный:",
+        ]
+
+        for index, item in enumerate(items[:10], 1):
+            duration = format_duration(item.get("duration"))
+            lines.append(
+                f"{index}. {escape(item['title'])} — "
+                f"{escape(item['artist'])} ({escape(duration)})"
+            )
+
+        await status_message.edit_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=url_choice_keyboard(items),
+        )
+
+    except Exception as e:
+        logger.exception("Ошибка обработки URL: %s", e)
+        await status_message.edit_text(
+            "❌ Не удалось получить данные по этой ссылке.\n\n"
+            "Попробуй отправить ссылку ещё раз.",
+        )
 
 
 # ============================================================
@@ -715,17 +926,16 @@ async def handle_text(
     if is_url(text):
 
         status = await message.answer(
-            "⏳ Обрабатываю ссылку..."
+            "🔎 Получаю данные именно по этой ссылке..."
         )
 
         await remember_bot_message(
             status
         )
 
-        await download_and_send(
+        await show_url_choices(
             status,
             text,
-            status_message=status,
         )
 
         return
@@ -794,6 +1004,59 @@ async def handle_text(
     await download_and_send(
         status,
         text,
+        status_message=status,
+    )
+
+
+# ============================================================
+# СКАЧИВАНИЕ ТОЧНОГО ЭЛЕМЕНТА ИЗ ССЫЛКИ
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("urlpick:")
+)
+async def download_url_item(
+    callback: CallbackQuery,
+):
+
+    key = callback.data.split(":", 1)[1]
+    data = callback_data_store.get(key)
+
+    if not data:
+        await callback.answer(
+            "Кнопка устарела.",
+            show_alert=True,
+        )
+        return
+
+    url = data.get("url")
+    title = data.get("title", "трек")
+
+    if not url:
+        await callback.answer(
+            "Ссылка недоступна.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("Загружаю именно выбранный материал...")
+
+    await delete_old_bot_messages(
+        callback.message.chat.id
+    )
+
+    status = await callback.message.answer(
+        f"⏳ Загружаю:\n<b>{escape(title)}</b>",
+        parse_mode="HTML",
+    )
+
+    await remember_bot_message(status)
+
+    # Здесь передаётся ИМЕННО URL, выбранный пользователем.
+    # yt-dlp не получает название для поиска.
+    await download_and_send(
+        callback.message,
+        url,
         status_message=status,
     )
 
