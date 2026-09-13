@@ -123,33 +123,22 @@ def escape(text: str) -> str:
 
 
 def clean_title(title: str) -> str:
+    """
+    Чистит только технический мусор в названии, но НЕ удаляет
+    признаки версии трека: Remix, Slowed, Reverb, Sped Up, Live,
+    Extended и т.п. Они важны для точного выбора песни.
+    """
+    title = str(title or "").strip()
 
     title = re.sub(
-        r"\(.*?\)",
-        "",
-        title,
-    )
-
-    title = re.sub(
-        r"\[.*?\]",
-        "",
-        title,
-    )
-
-    title = re.sub(
-        r"(?i)\b"
-        r"(official|video|audio|lyrics|lyric|"
-        r"music|remix|visualizer|hd|4k)"
-        r"\b",
-        "",
-        title,
-    )
-
-    title = re.sub(
-        r"\s+",
+        r"(?i)\b(official\s+music\s+video|official\s+video|official\s+audio|\blyrics?\b|\bvisualizer\b|\bhd\b|\b4k\b)",
         " ",
         title,
     )
+
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"\s+([)\]])", r"\1", title)
+    title = re.sub(r"([(\[])[ ]+", r"\1", title)
 
     return title.strip(" -_")
 
@@ -248,26 +237,33 @@ async def fetch_itunes_info(
 def song_info_keyboard(
     artist: str,
     track_name: str,
+    source_url: str | None = None,
+    variants: list | None = None,
 ):
+    buttons = []
 
-    key = save_callback(
-        {
-            "type": "info",
-            "artist": artist,
-            "track": track_name,
-        }
-    )
+    info_key = save_callback({
+        "type": "info",
+        "artist": artist,
+        "track": track_name,
+        "source_url": source_url,
+    })
+    buttons.append([InlineKeyboardButton(
+        text="ℹ️ Информация о треке",
+        callback_data=f"info:{info_key}",
+    )])
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="ℹ️ Информация о треке",
-                    callback_data=f"info:{key}",
-                )
-            ]
-        ]
-    )
+    if variants and len(variants) > 1:
+        variant_key = save_callback({
+            "type": "variants",
+            "items": variants,
+        })
+        buttons.append([InlineKeyboardButton(
+            text="🔀 Другие варианты",
+            callback_data=f"variants:{variant_key}",
+        )])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ============================================================
@@ -376,13 +372,7 @@ def url_choice_keyboard(items: list):
 
 
 def _search_full_version_sync(title: str, artist: str):
-    """
-    Если ссылка ведёт на короткий фрагмент (например TikTok/Shorts),
-    ищем полноценную версию по названию И исполнителю.
-
-    Важно: исходное название не очищаем, поэтому сохраняются слова
-    Remix / Slowed / Reverb / Sped Up / Extended / Live и т.п.
-    """
+    """Ищет полноценные версии короткого источника на YouTube."""
     title = str(title or "").strip()
     artist = str(artist or "").strip()
     query = " ".join(x for x in (artist, title) if x)
@@ -394,7 +384,7 @@ def _search_full_version_sync(title: str, artist: str):
         "no_warnings": True,
         "noplaylist": True,
         "extract_flat": True,
-        "playlistend": 8,
+        "playlistend": 10,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -405,19 +395,21 @@ def _search_full_version_sync(title: str, artist: str):
     }
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch8:{query} full song", download=False)
+        info = ydl.extract_info(
+            f"ytsearch10:{query}",
+            download=False,
+        )
 
     results = []
     for entry in (info.get("entries") or []):
         if not entry:
             continue
-        duration = entry.get("duration")
         try:
-            duration = int(duration) if duration else 0
+            duration = int(entry.get("duration") or 0)
         except (TypeError, ValueError):
             duration = 0
-        # Полноценный трек обычно заметно длиннее короткого фрагмента.
-        if duration < 150:
+        # Отбрасываем Shorts/тизеры/обрывки. Обычная песня обычно > 2 минут.
+        if duration and duration < 120:
             continue
 
         item_url = entry.get("webpage_url") or entry.get("original_url")
@@ -439,18 +431,19 @@ def _search_full_version_sync(title: str, artist: str):
             "duration": duration,
         })
 
-    return results
+    # Убираем дубли по URL.
+    unique = []
+    seen = set()
+    for item in results:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        unique.append(item)
+    return unique
+
 
 def extract_url_choices_sync(url: str):
-    """
-    Получает содержимое ИМЕННО переданной ссылки.
-
-    Важное правило:
-    - ссылка на конкретный ролик/трек -> только этот материал;
-    - ссылка на настоящий плейлист -> показываем элементы плейлиста;
-    - название из ссылки не используется для нового поиска.
-    """
-
+    """Получает именно ссылку и при необходимости ищет её полную версию."""
     def base_opts(noplaylist: bool):
         return {
             "quiet": True,
@@ -467,47 +460,35 @@ def extract_url_choices_sync(url: str):
             },
         }
 
-    # YouTube-ссылка вида /watch?v=...&list=... всё равно указывает
-    # на конкретный ролик. Убираем только параметр list, чтобы yt-dlp
-    # случайно не переключился на весь плейлист.
     parsed = urlparse(url)
     query = parse_qs(parsed.query, keep_blank_values=True)
     is_youtube_video = (
-        "youtube.com" in parsed.netloc.lower()
-        and "v" in query
+        "youtube.com" in parsed.netloc.lower() and "v" in query
     ) or (
-        "youtu.be" in parsed.netloc.lower()
-        and bool(parsed.path.strip("/"))
+        "youtu.be" in parsed.netloc.lower() and bool(parsed.path.strip("/"))
     )
 
     exact_url = url
     if is_youtube_video and "v" in query:
         clean_query = {k: v for k, v in query.items() if k != "list"}
         exact_url = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            urlencode(clean_query, doseq=True),
-            parsed.fragment,
+            parsed.scheme, parsed.netloc, parsed.path, parsed.params,
+            urlencode(clean_query, doseq=True), parsed.fragment,
         ))
 
-    # Сначала всегда пробуем извлечь ровно один материал.
     with yt_dlp.YoutubeDL(base_opts(True)) as ydl:
         exact_info = ydl.extract_info(exact_url, download=False)
 
     if not exact_info:
         raise RuntimeError("По ссылке ничего не найдено.")
 
-    # Если это конкретный материал — сначала смотрим его реальную
-    # длительность. Если это короткий фрагмент, ищем полноценную
-    # версию по НАЗВАНИЮ + ИСПОЛНИТЕЛЮ, сохраняя слова Remix/Slowed/etc.
     if not exact_info.get("entries"):
         exact_item = {
             "url": exact_info.get("webpage_url") or exact_url,
             "title": exact_info.get("title") or "Без названия",
             "artist": (
                 exact_info.get("artist")
+                or exact_info.get("creator")
                 or exact_info.get("uploader")
                 or exact_info.get("channel")
                 or "Неизвестный исполнитель"
@@ -520,47 +501,40 @@ def extract_url_choices_sync(url: str):
         except (TypeError, ValueError):
             source_duration = 0
 
-        # 0:00-2:29 считаем потенциальным фрагментом.
-        # Если это полноценная короткая песня, её всё равно можно
-        # скачать через кнопку исходного материала ниже.
-        if source_duration and source_duration < 150:
+        # Короткие ссылки (TikTok/Shorts/тизеры) автоматически заменяем
+        # на полноценный трек. Остальное скачиваем напрямую.
+        if source_duration and source_duration < 120:
             full_versions = _search_full_version_sync(
-                exact_item["title"],
-                exact_item["artist"],
+                exact_item["title"], exact_item["artist"]
             )
             if full_versions:
-                # Сначала показываем найденные полноценные версии.
-                return full_versions[:5]
+                return {
+                    "source": exact_item,
+                    "full_versions": full_versions[:8],
+                }
 
-        return [exact_item]
+        return {"source": exact_item, "full_versions": []}
 
-    # Если пользователь прислал настоящий плейлист, получаем его элементы.
     with yt_dlp.YoutubeDL(base_opts(False)) as ydl:
         info = ydl.extract_info(url, download=False)
-
-    if not info:
-        raise RuntimeError("Не удалось получить содержимое ссылки.")
 
     items = []
     for entry in (info.get("entries") or []):
         if not entry:
             continue
-
         item_url = entry.get("webpage_url") or entry.get("original_url")
-        if not item_url:
-            entry_id = entry.get("id")
+        if not item_url and entry.get("id"):
             extractor_key = str(info.get("extractor_key", "")).lower()
-            if entry_id and "youtube" in extractor_key:
-                item_url = f"https://www.youtube.com/watch?v={entry_id}"
-
+            if "youtube" in extractor_key:
+                item_url = f"https://www.youtube.com/watch?v={entry['id']}"
         if not item_url:
             continue
-
         items.append({
             "url": item_url,
             "title": entry.get("title") or "Без названия",
             "artist": (
                 entry.get("artist")
+                or entry.get("creator")
                 or entry.get("uploader")
                 or entry.get("channel")
                 or "Неизвестный исполнитель"
@@ -570,83 +544,68 @@ def extract_url_choices_sync(url: str):
 
     if not items:
         raise RuntimeError("В этой ссылке не найдено доступных треков.")
+    return {"source": None, "full_versions": items}
 
-    return items
+
+def variants_keyboard(items: list):
+    buttons = []
+    for index, item in enumerate(items[:8], 1):
+        title = str(item.get("title") or "Без названия")
+        duration = format_duration(item.get("duration"))
+        label = f"🎵 {index}. {title[:45]}"
+        if duration != "—":
+            label += f" · {duration}"
+        key = save_callback({
+            "type": "url_download",
+            "url": item.get("url"),
+            "title": title,
+        })
+        buttons.append([InlineKeyboardButton(
+            text=label[:64], callback_data=f"urlpick:{key}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def show_url_choices(status_message: Message, url: str):
-    """Показывает данные, полученные именно из переданной ссылки."""
-
+    """Без превью: сразу скачивает лучший полный вариант."""
     try:
-        items = await asyncio.to_thread(
-            extract_url_choices_sync,
-            url,
-        )
+        result = await asyncio.to_thread(extract_url_choices_sync, url)
+        source = result.get("source")
+        versions = result.get("full_versions") or []
 
-        if not items:
-            raise RuntimeError("По ссылке ничего не найдено.")
-
-        # Одна конкретная страница или один подходящий результат.
-        if len(items) == 1:
-            item = items[0]
-
-            key = save_callback({
-                "type": "url_download",
-                "url": item["url"],
-                "title": item.get("title", "Без названия"),
-            })
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="⬇️ Скачать именно это",
-                            callback_data=f"urlpick:{key}",
-                        )
-                    ]
-                ]
-            )
-
-            duration = format_duration(item.get("duration"))
-
-            await status_message.edit_text(
-                "🔗 <b>Получено по твоей ссылке</b>\n\n"
-                f"🎵 <b>{escape(item['title'])}</b>\n"
-                f"👤 {escape(item['artist'])}\n"
-                f"⏱ {escape(duration)}\n\n"
-                "Нажми кнопку — бот скачает именно этот материал, "
-                "не выполняя поиск по названию.",
-                parse_mode="HTML",
-                reply_markup=keyboard,
+        if source:
+            # Для короткой ссылки берём лучший полноценный результат сразу.
+            download_url = versions[0]["url"] if versions else source["url"]
+            await download_and_send(
+                status_message,
+                download_url,
+                status_message=status_message,
+                variants=(versions if versions else []),
             )
             return
 
-        # Если ссылка содержит несколько элементов (например, плейлист),
-        # показываем выбор из реально полученных элементов.
-        lines = [
-            "🔗 <b>По ссылке найдено несколько элементов</b>",
-            "\nВыбери нужный:",
-        ]
-
-        for index, item in enumerate(items[:10], 1):
-            duration = format_duration(item.get("duration"))
-            lines.append(
-                f"{index}. {escape(item['title'])} — "
-                f"{escape(item['artist'])} ({escape(duration)})"
+        # Плейлист: не показываем предпросмотр, а сразу скачиваем первый
+        # найденный элемент и сохраняем остальные как варианты.
+        if versions:
+            await download_and_send(
+                status_message,
+                versions[0]["url"],
+                status_message=status_message,
+                variants=versions,
             )
+            return
 
-        await status_message.edit_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=url_choice_keyboard(items),
-        )
+        raise RuntimeError("По ссылке ничего не найдено.")
 
     except Exception as e:
-        logger.exception("Ошибка обработки URL: %s", e)
-        await status_message.edit_text(
-            "❌ Не удалось получить данные по этой ссылке.\n\n"
-            "Попробуй отправить ссылку ещё раз.",
-        )
+        logger.exception("Ошибка обработки ссылки: %s", e)
+        try:
+            await status_message.edit_text(
+                "❌ Не удалось получить полноценный трек по этой ссылке.\n\n"
+                "Попробуй другую ссылку на тот же трек."
+            )
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -811,6 +770,7 @@ async def download_and_send(
     target_message: Message,
     query: str,
     status_message: Message | None = None,
+    variants: list | None = None,
 ):
 
     file_path = None
@@ -867,6 +827,8 @@ async def download_and_send(
             reply_markup=song_info_keyboard(
                 str(performer),
                 clean_name,
+                source_url=(info.get("webpage_url") if is_url(query) else None),
+                variants=variants,
             ),
         )
 
@@ -1035,7 +997,7 @@ async def handle_text(
     if is_url(text):
 
         status = await message.answer(
-            "🔎 Получаю данные именно по этой ссылке..."
+            "⏳ Загружаю полноценную версию..."
         )
 
         await remember_bot_message(
@@ -1167,6 +1129,31 @@ async def download_url_item(
         callback.message,
         url,
         status_message=status,
+    )
+
+
+@dp.callback_query(
+    F.data.startswith("variants:")
+)
+async def show_variants(
+    callback: CallbackQuery,
+):
+    key = callback.data.split(":", 1)[1]
+    data = callback_data_store.get(key)
+    if not data:
+        await callback.answer("Варианты устарели.", show_alert=True)
+        return
+
+    items = data.get("items") or []
+    if not items:
+        await callback.answer("Вариантов нет.", show_alert=True)
+        return
+
+    await callback.answer("Выбери нужную версию")
+    await callback.message.answer(
+        "🔀 <b>Другие варианты</b>\n\nВыбери трек:",
+        parse_mode="HTML",
+        reply_markup=variants_keyboard(items),
     )
 
 
@@ -1329,6 +1316,72 @@ async def show_artist_info(
 # ИНФОРМАЦИЯ О ТРЕКЕ
 # ============================================================
 
+def get_track_info_from_url_sync(url: str):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0 Safari/537.36"
+            )
+        },
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if info and info.get("entries"):
+            entries = info.get("entries") or []
+            return entries[0] if entries else None
+        return info
+
+
+async def send_track_info_message(message: Message, info: dict):
+    title = clean_title(info.get("title") or "Неизвестный трек")
+    artist = (
+        info.get("artist")
+        or info.get("creator")
+        or info.get("uploader")
+        or info.get("channel")
+        or "Неизвестный исполнитель"
+    )
+    album = info.get("album") or info.get("collection") or "Не указан"
+    genre = info.get("genre") or "Не указан"
+    duration = format_duration(info.get("duration"))
+    date = info.get("release_date") or info.get("upload_date") or ""
+    year = str(date)[:4] if date else "Неизвестно"
+    channel = info.get("channel") or info.get("uploader")
+
+    lines = [
+        f"🎵 <b>{escape(title)}</b>",
+        f"👤 {escape(artist)}",
+        "",
+        f"💿 Альбом: <b>{escape(album)}</b>",
+        f"📅 Год: <b>{escape(year)}</b>",
+        f"🎸 Жанр: <b>{escape(genre)}</b>",
+        f"⏱ Длительность: <b>{escape(duration)}</b>",
+    ]
+    if channel and str(channel) != str(artist):
+        lines.append(f"📺 Канал: <b>{escape(channel)}</b>")
+
+    source = info.get("webpage_url")
+    if source:
+        lines.append(f'\n<a href="{escape(source)}">Источник</a>')
+
+    thumbnail = info.get("thumbnail")
+    text = "\n".join(lines)
+    if thumbnail:
+        try:
+            msg = await message.answer_photo(photo=thumbnail, caption=text, parse_mode="HTML")
+        except Exception:
+            msg = await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    else:
+        msg = await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await remember_bot_message(msg)
+
+
 def get_track_info_sync(artist_query: str, track_query: str):
     """
     Получает информацию напрямую через yt-dlp.
@@ -1407,6 +1460,20 @@ async def show_song_info(
     await callback.answer(
         "Загружаю информацию..."
     )
+
+    source_url = data.get("source_url")
+
+    # Если музыка была скачана по ссылке, сначала читаем МЕТАДАННЫЕ
+    # именно этого материала. Это исключает случай, когда поиск находит
+    # другой трек с похожим названием.
+    if source_url:
+        try:
+            exact = await asyncio.to_thread(get_track_info_from_url_sync, source_url)
+            if exact:
+                await send_track_info_message(callback.message, exact)
+                return
+        except Exception as e:
+            logger.warning("Не удалось получить точную информацию по URL: %s", e)
 
     # Сначала пробуем iTunes.
     results = await fetch_itunes_info(
