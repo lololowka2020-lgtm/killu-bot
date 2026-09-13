@@ -598,7 +598,54 @@ def download_thumbnail_sync(url: str, unique_id: str):
         with Image.open(raw) as image:
             image = image.convert("RGB")
             image.thumbnail((320, 320), Image.Resampling.LANCZOS)
-            image.save(path, "JPEG", quality=78, optimize=True)
+
+            # Мрачная, но аккуратная стилизация обложки.
+            # Текст/название трека не изменяем — меняем только изображение.
+            from PIL import ImageEnhance, ImageFilter, ImageDraw
+            import random
+
+            image = ImageEnhance.Contrast(image).enhance(1.12)
+            image = ImageEnhance.Brightness(image).enhance(0.70)
+            image = ImageEnhance.Color(image).enhance(0.82)
+            image = image.convert("RGBA")
+            w, h = image.size
+
+            # Чёрная дымка поверх изображения.
+            overlay = Image.new("RGBA", image.size, (0, 0, 0, 62))
+            image = Image.alpha_composite(image, overlay)
+
+            # Едва заметный холодный/красный тон по краям.
+            tint = Image.new("RGBA", image.size, (90, 0, 12, 0))
+            tint.putalpha(24)
+            image = Image.alpha_composite(image, tint)
+
+            # Виньетка.
+            vignette = Image.new("L", image.size, 0)
+            draw = ImageDraw.Draw(vignette)
+            draw.ellipse((-int(w * 0.20), -int(h * 0.20), int(w * 1.20), int(h * 1.20)), fill=205)
+            vignette = vignette.filter(ImageFilter.GaussianBlur(max(10, min(w, h) // 9)))
+            dark = Image.new("RGBA", image.size, (0, 0, 0, 145))
+            dark.putalpha(vignette.point(lambda x: 145 - x // 2))
+            image = Image.alpha_composite(image, dark)
+
+            # Лёгкое зерно для creepy-визуала, без перегруза.
+            grain = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            pixels = grain.load()
+            step = max(2, min(w, h) // 120)
+            for y in range(0, h, step):
+                for x in range(0, w, step):
+                    if random.random() < 0.18:
+                        a = random.randint(8, 24)
+                        pixels[x, y] = (255, 255, 255, a)
+            grain = grain.filter(ImageFilter.GaussianBlur(0.35))
+            image = Image.alpha_composite(image, grain)
+
+            # Тонкая красная рамка/акцент.
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((2, 2, w - 3, h - 3), outline=(115, 0, 15, 125), width=2)
+            draw.line((0, h - 3, w, h - 3), fill=(135, 0, 18, 165), width=2)
+
+            image.convert("RGB").save(path, "JPEG", quality=78, optimize=True)
         try: os.remove(raw)
         except OSError: pass
         if os.path.getsize(path) > 200 * 1024:
