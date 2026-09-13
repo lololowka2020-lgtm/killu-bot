@@ -5,7 +5,9 @@ import os
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import re
 import uuid
+from urllib.request import Request, urlopen
 
+from PIL import Image
 import aiohttp
 import yt_dlp
 
@@ -547,23 +549,70 @@ def extract_url_choices_sync(url: str):
     return {"source": None, "full_versions": items}
 
 
+def variant_display_name(title: str) -> str:
+    title = str(title or "Без названия")
+    low = title.lower()
+    for marker, label in [
+        ("slowed + reverb", "🌙 Slowed + Reverb"),
+        ("slowed reverb", "🌙 Slowed + Reverb"),
+        ("slowed", "🌙 Slowed"),
+        ("sped up", "⚡ Sped Up"),
+        ("speed up", "⚡ Sped Up"),
+        ("remix", "🎚 Remix"),
+        ("extended", "⏳ Extended"),
+        ("live", "🎤 Live"),
+        ("acoustic", "🎸 Acoustic"),
+        ("instrumental", "🎹 Instrumental"),
+        ("karaoke", "🎙 Karaoke"),
+    ]:
+        if marker in low:
+            return label
+    return "🎵 Original"
+
+
 def variants_keyboard(items: list):
     buttons = []
     for index, item in enumerate(items[:8], 1):
         title = str(item.get("title") or "Без названия")
         duration = format_duration(item.get("duration"))
-        label = f"🎵 {index}. {title[:45]}"
+        label = f"{variant_display_name(title)} · {index}"
         if duration != "—":
             label += f" · {duration}"
-        key = save_callback({
-            "type": "url_download",
-            "url": item.get("url"),
-            "title": title,
-        })
-        buttons.append([InlineKeyboardButton(
-            text=label[:64], callback_data=f"urlpick:{key}"
-        )])
+        key = save_callback({"type": "url_download", "url": item.get("url"), "title": title})
+        buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"urlpick:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def download_thumbnail_sync(url: str, unique_id: str):
+    """Скачивает обложку и делает JPEG до 320x320 и 200 КБ."""
+    if not url:
+        return None
+    path = os.path.join(DOWNLOAD_DIR, f"{unique_id}_cover.jpg")
+    raw = os.path.join(DOWNLOAD_DIR, f"{unique_id}_cover_raw")
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=15) as response:
+            data = response.read(5 * 1024 * 1024)
+        with open(raw, "wb") as f:
+            f.write(data)
+        with Image.open(raw) as image:
+            image = image.convert("RGB")
+            image.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            image.save(path, "JPEG", quality=78, optimize=True)
+        try: os.remove(raw)
+        except OSError: pass
+        if os.path.getsize(path) > 200 * 1024:
+            with Image.open(path) as image:
+                for quality in (65, 55, 45, 35):
+                    image.save(path, "JPEG", quality=quality, optimize=True)
+                    if os.path.getsize(path) <= 200 * 1024:
+                        break
+        return path if os.path.exists(path) and os.path.getsize(path) <= 200 * 1024 else None
+    except Exception:
+        for x in (path, raw):
+            try: os.remove(x)
+            except OSError: pass
+        return None
 
 
 async def show_url_choices(status_message: Message, url: str):
@@ -774,6 +823,7 @@ async def download_and_send(
 ):
 
     file_path = None
+    cover_path = None
 
     try:
 
@@ -802,10 +852,28 @@ async def download_and_send(
             or "Неизвестный исполнитель"
         )
 
-        caption = (
-            f"🎵 <b>{escape(clean_name)}</b>\n"
-            f"👤 {escape(performer)}"
-        )
+        album = info.get("album") or info.get("playlist")
+        release_date = info.get("release_date") or info.get("upload_date") or ""
+        year = str(release_date)[:4] if release_date else ""
+        genre = info.get("genre") or ""
+
+        caption_lines = [
+            f"🎵 <b>{escape(clean_name)}</b>",
+            f"👤 {escape(performer)}",
+        ]
+        if album:
+            caption_lines.append(f"💿 {escape(album)}")
+        if year.isdigit():
+            caption_lines.append(f"📅 {escape(year)}")
+        if genre:
+            caption_lines.append(f"🎸 {escape(genre)}")
+        caption = "\n".join(caption_lines)
+
+        thumbnail_url = info.get("thumbnail")
+        if thumbnail_url:
+            cover_path = await asyncio.to_thread(
+                download_thumbnail_sync, thumbnail_url, uuid.uuid4().hex
+            )
 
         # ВАЖНО:
         # Музыкальное сообщение не записываем
@@ -824,6 +892,7 @@ async def download_and_send(
             performer=str(
                 performer
             )[:64],
+            thumbnail=(FSInputFile(cover_path) if cover_path else None),
             reply_markup=song_info_keyboard(
                 str(performer),
                 clean_name,
@@ -861,18 +930,18 @@ async def download_and_send(
                         status_message.message_id
                     )
 
-        # Удаляем скачанный файл.
+        # Удаляем временные файлы. Музыка в Telegram остаётся.
         try:
-
-            os.remove(
-                file_path
-            )
-
+            os.remove(file_path)
         except OSError:
             pass
-
         file_path = None
-
+        if cover_path:
+            try:
+                os.remove(cover_path)
+            except OSError:
+                pass
+            cover_path = None
     except Exception as e:
 
         logger.exception(
@@ -912,13 +981,13 @@ async def download_and_send(
     finally:
 
         if file_path:
-
             try:
-
-                os.remove(
-                    file_path
-                )
-
+                os.remove(file_path)
+            except OSError:
+                pass
+        if cover_path:
+            try:
+                os.remove(cover_path)
             except OSError:
                 pass
 
