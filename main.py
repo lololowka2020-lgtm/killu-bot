@@ -352,6 +352,95 @@ def format_duration(seconds):
     return f"{minutes}:{seconds:02d}"
 
 
+
+def url_choice_keyboard(items: list):
+    buttons = []
+    for index, item in enumerate(items[:10], 1):
+        title = str(item.get("title") or "Без названия")
+        duration = format_duration(item.get("duration"))
+        label = f"🎵 {index}. {title[:42]}"
+        if duration != "—":
+            label += f" · {duration}"
+        key = save_callback({
+            "type": "url_download",
+            "url": item.get("url"),
+            "title": title,
+        })
+        buttons.append([
+            InlineKeyboardButton(
+                text=label[:64],
+                callback_data=f"urlpick:{key}",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _search_full_version_sync(title: str, artist: str):
+    """
+    Если ссылка ведёт на короткий фрагмент (например TikTok/Shorts),
+    ищем полноценную версию по названию И исполнителю.
+
+    Важно: исходное название не очищаем, поэтому сохраняются слова
+    Remix / Slowed / Reverb / Sped Up / Extended / Live и т.п.
+    """
+    title = str(title or "").strip()
+    artist = str(artist or "").strip()
+    query = " ".join(x for x in (artist, title) if x)
+    if not query:
+        return []
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extract_flat": True,
+        "playlistend": 8,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0 Safari/537.36"
+            )
+        },
+    }
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch8:{query} full song", download=False)
+
+    results = []
+    for entry in (info.get("entries") or []):
+        if not entry:
+            continue
+        duration = entry.get("duration")
+        try:
+            duration = int(duration) if duration else 0
+        except (TypeError, ValueError):
+            duration = 0
+        # Полноценный трек обычно заметно длиннее короткого фрагмента.
+        if duration < 150:
+            continue
+
+        item_url = entry.get("webpage_url") or entry.get("original_url")
+        if not item_url and entry.get("id"):
+            item_url = f"https://www.youtube.com/watch?v={entry['id']}"
+        if not item_url:
+            continue
+
+        results.append({
+            "url": item_url,
+            "title": entry.get("title") or title,
+            "artist": (
+                entry.get("artist")
+                or entry.get("uploader")
+                or entry.get("channel")
+                or artist
+                or "Неизвестный исполнитель"
+            ),
+            "duration": duration,
+        })
+
+    return results
+
 def extract_url_choices_sync(url: str):
     """
     Получает содержимое ИМЕННО переданной ссылки.
@@ -410,9 +499,11 @@ def extract_url_choices_sync(url: str):
     if not exact_info:
         raise RuntimeError("По ссылке ничего не найдено.")
 
-    # Если это конкретный ролик/трек — возвращаем только его.
+    # Если это конкретный материал — сначала смотрим его реальную
+    # длительность. Если это короткий фрагмент, ищем полноценную
+    # версию по НАЗВАНИЮ + ИСПОЛНИТЕЛЮ, сохраняя слова Remix/Slowed/etc.
     if not exact_info.get("entries"):
-        return [{
+        exact_item = {
             "url": exact_info.get("webpage_url") or exact_url,
             "title": exact_info.get("title") or "Без названия",
             "artist": (
@@ -422,7 +513,26 @@ def extract_url_choices_sync(url: str):
                 or "Неизвестный исполнитель"
             ),
             "duration": exact_info.get("duration"),
-        }]
+        }
+
+        try:
+            source_duration = int(exact_item.get("duration") or 0)
+        except (TypeError, ValueError):
+            source_duration = 0
+
+        # 0:00-2:29 считаем потенциальным фрагментом.
+        # Если это полноценная короткая песня, её всё равно можно
+        # скачать через кнопку исходного материала ниже.
+        if source_duration and source_duration < 150:
+            full_versions = _search_full_version_sync(
+                exact_item["title"],
+                exact_item["artist"],
+            )
+            if full_versions:
+                # Сначала показываем найденные полноценные версии.
+                return full_versions[:5]
+
+        return [exact_item]
 
     # Если пользователь прислал настоящий плейлист, получаем его элементы.
     with yt_dlp.YoutubeDL(base_opts(False)) as ydl:
@@ -476,8 +586,7 @@ async def show_url_choices(status_message: Message, url: str):
         if not items:
             raise RuntimeError("По ссылке ничего не найдено.")
 
-        # Одна конкретная страница: не ищем оригинал,
-        # а показываем ровно то, что вернул источник по этой URL.
+        # Одна конкретная страница или один подходящий результат.
         if len(items) == 1:
             item = items[0]
 
