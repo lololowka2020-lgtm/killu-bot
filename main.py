@@ -272,75 +272,74 @@ def song_info_keyboard(
 # КЛАВИАТУРА ИСПОЛНИТЕЛЯ
 # ============================================================
 
-def search_result_keyboard(tracks: list):
-    """Мрачный минималистичный выбор результатов: данные трека остаются прежними."""
+def artist_keyboard(
+    artist_name: str,
+    tracks: list,
+):
+
     buttons = []
-    for index, track in enumerate(tracks[:8], 1):
-        track_name = str(track.get("trackName") or "Неизвестный трек").strip()
-        artist = str(track.get("artistName") or "Неизвестный исполнитель").strip()
+
+    for track in tracks:
+
+        track_name = track.get(
+            "trackName",
+            "Неизвестный трек",
+        )
+
+        artist = track.get(
+            "artistName",
+            artist_name,
+        )
+
+        key = save_callback(
+            {
+                "type": "download",
+                "query": f"{artist} - {track_name}",
+            }
+        )
+
         album = str(track.get("collectionName") or "").strip()
         ms = track.get("trackTimeMillis")
         duration = format_duration(ms / 1000) if ms else "—"
-        first = f"▸ {index:02d}  {track_name}"
-        details = artist
+
+        # Подробная кнопка выбора: название + исполнитель + альбом + длительность.
+        first = f"▸ {track_name}"
+        second = f"└ {artist}"
         if album:
-            details += f"  ·  {album}"
+            second += f" · {album}"
         if duration != "—":
-            details += f"  ·  {duration}"
-        label = f"{first[:42]}\\n└ {details[:45]}"
-        key = save_callback({"type": "download", "query": f"{artist} - {track_name}"})
-        buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"download:{key}")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+            second += f" · {duration}"
 
-def artist_keyboard(artist_name: str, tracks: list):
-    """Совместимость со старым обработчиком."""
-    return search_result_keyboard(tracks)
+        label = f"{first[:42]}\n{second[:45]}"
 
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:64],
+                    callback_data=f"download:{key}",
+                )
+            ]
+        )
 
-def format_search_results_text(tracks: list, query: str) -> str:
-    """Подробная карточка результатов, чтобы одинаковые песни не путались."""
-    if not tracks:
-        return "🔎 Ничего не найдено."
+    artist_key = save_callback(
+        {
+            "type": "artist",
+            "artist": artist_name,
+        }
+    )
 
-    first = tracks[0]
-    title = str(first.get("trackName") or query).strip()
-    artist = str(first.get("artistName") or "Неизвестный исполнитель").strip()
-    album = str(first.get("collectionName") or "Не указан").strip()
-    genre = str(first.get("primaryGenreName") or "").strip()
-    year = str(first.get("releaseDate") or "")[:4]
-    ms = first.get("trackTimeMillis")
-    duration = format_duration(ms / 1000) if ms else "—"
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="👤 Информация об исполнителе",
+                callback_data=f"artist:{artist_key}",
+            )
+        ]
+    )
 
-    lines = [
-        f"🎵 <b>{escape(title)}</b>",
-        f"👤 <b>{escape(artist)}</b>",
-        f"💿 <b>{escape(album)}</b>",
-    ]
-    if year.isdigit():
-        lines.append(f"📅 <b>{escape(year)}</b>")
-    if genre:
-        lines.append(f"🎸 <b>{escape(genre)}</b>")
-    if duration != "—":
-        lines.append(f"⏱ <b>{escape(duration)}</b>")
-
-    lines.append("")
-    lines.append("<b>Другие найденные версии:</b>")
-
-    for i, track in enumerate(tracks[:8], 1):
-        t = str(track.get("trackName") or "Без названия").strip()
-        a = str(track.get("artistName") or "Неизвестный исполнитель").strip()
-        alb = str(track.get("collectionName") or "").strip()
-        ms = track.get("trackTimeMillis")
-        dur = format_duration(ms / 1000) if ms else "—"
-
-        item = f"{i}. {a} — {t}"
-        if alb:
-            item += f" · {alb}"
-        if dur != "—":
-            item += f" · {dur}"
-        lines.append(escape(item[:180]))
-
-    return "\n".join(lines)
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons
+    )
 
 
 # ============================================================
@@ -367,20 +366,26 @@ def format_duration(seconds):
 
 
 def url_choice_keyboard(items: list):
-    """Мрачный выбор треков по ссылке."""
     buttons = []
     for index, item in enumerate(items[:10], 1):
         title = str(item.get("title") or "Без названия")
-        artist = str(item.get("artist") or item.get("creator") or item.get("uploader") or "Неизвестный исполнитель").strip()
         duration = format_duration(item.get("duration"))
-        first = f"▸ {index:02d}  {title}"
-        second = artist
+        label = f"🎵 {index}. {title[:42]}"
         if duration != "—":
-            second += f"  ·  {duration}"
-        label = f"{first[:42]}\\n└ {second[:45]}"
-        key = save_callback({"type": "url_download", "url": item.get("url"), "title": title})
-        buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"urlpick:{key}")])
+            label += f" · {duration}"
+        key = save_callback({
+            "type": "url_download",
+            "url": item.get("url"),
+            "title": title,
+        })
+        buttons.append([
+            InlineKeyboardButton(
+                text=label[:64],
+                callback_data=f"urlpick:{key}",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 def _search_full_version_sync(title: str, artist: str):
     """Ищет полноценные версии короткого источника на YouTube."""
@@ -580,20 +585,17 @@ def variant_display_name(title: str) -> str:
 
 
 def variants_keyboard(items: list):
-    """Мрачный, но чистый список вариантов."""
     buttons = []
     for index, item in enumerate(items[:8], 1):
         title = str(item.get("title") or "Без названия")
-        artist = str(item.get("artist") or item.get("creator") or item.get("uploader") or "").strip()
         duration = format_duration(item.get("duration"))
-        variant = variant_display_name(title)
-        second = artist
+        label = f"{variant_display_name(title)} · {index}"
         if duration != "—":
-            second += f"  ·  {duration}" if second else duration
-        label = f"▸ {index:02d}  {variant}\\n└ {second[:45]}"
+            label += f" · {duration}"
         key = save_callback({"type": "url_download", "url": item.get("url"), "title": title})
         buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"urlpick:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 def download_thumbnail_sync(url: str, unique_id: str):
     """Скачивает обложку и делает JPEG до 320x320 и 200 КБ."""
@@ -616,8 +618,8 @@ def download_thumbnail_sync(url: str, unique_id: str):
             from PIL import ImageEnhance, ImageFilter, ImageDraw
             import random
 
-            image = ImageEnhance.Contrast(image).enhance(1.16)
-            image = ImageEnhance.Brightness(image).enhance(0.62)
+            image = ImageEnhance.Contrast(image).enhance(1.12)
+            image = ImageEnhance.Brightness(image).enhance(0.70)
             image = ImageEnhance.Color(image).enhance(0.82)
             image = image.convert("RGBA")
             w, h = image.size
@@ -627,8 +629,8 @@ def download_thumbnail_sync(url: str, unique_id: str):
             image = Image.alpha_composite(image, overlay)
 
             # Едва заметный холодный/красный тон по краям.
-            tint = Image.new("RGBA", image.size, (55, 0, 8, 0))
-            tint.putalpha(18)
+            tint = Image.new("RGBA", image.size, (90, 0, 12, 0))
+            tint.putalpha(24)
             image = Image.alpha_composite(image, tint)
 
             # Виньетка.
@@ -654,8 +656,8 @@ def download_thumbnail_sync(url: str, unique_id: str):
 
             # Тонкая красная рамка/акцент.
             draw = ImageDraw.Draw(image)
-            draw.rectangle((2, 2, w - 3, h - 3), outline=(80, 0, 10, 90), width=1)
-            draw.line((0, h - 2, w, h - 2), fill=(95, 0, 12, 105), width=1)
+            draw.rectangle((2, 2, w - 3, h - 3), outline=(115, 0, 15, 125), width=2)
+            draw.line((0, h - 3, w, h - 3), fill=(135, 0, 18, 165), width=2)
 
             image.convert("RGB").save(path, "JPEG", quality=78, optimize=True)
         try: os.remove(raw)
@@ -1152,76 +1154,52 @@ async def handle_text(
     )
 
     # ========================================================
-    # ПОИСК ПЕСНИ
+    # ИЩЕМ ИСПОЛНИТЕЛЯ
     # ========================================================
-    # Сначала ищем именно песни, а не исполнителя.
-    # Так при запросе вроде "Faded" пользователь сразу видит
-    # название + исполнителя + альбом и не путает одинаковые результаты.
 
-    tracks = await fetch_itunes_info(
-        text,
-        entity="song",
-        limit=8,
-    )
-
-    if tracks:
-        keyboard = search_result_keyboard(tracks)
-        details = format_search_results_text(tracks, text)
-        artwork = tracks[0].get("artworkUrl600") or tracks[0].get("artworkUrl100")
-
-        try:
-            if artwork:
-                await bot.delete_message(
-                    chat_id=status.chat.id,
-                    message_id=status.message_id,
-                )
-                await remember_bot_message(status)
-                result_message = await bot.send_photo(
-                    chat_id=status.chat.id,
-                    photo=artwork,
-                    caption=details,
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
-                await remember_bot_message(result_message)
-            else:
-                await status.edit_text(
-                    details,
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
-        except Exception:
-            await status.edit_text(
-                details,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        return
-
-    # Если песен не нашли — пробуем найти исполнителя.
-    artist_results = await fetch_itunes_info(
-        text,
-        entity="musicArtist",
-        limit=1,
+    artist_results = (
+        await fetch_itunes_info(
+            text,
+            entity="musicArtist",
+            limit=1,
+        )
     )
 
     if artist_results:
-        artist_name = artist_results[0].get("artistName", text)
-        artist_tracks = await fetch_itunes_info(
-            artist_name,
-            entity="song",
-            limit=8,
+
+        artist = artist_results[0]
+
+        artist_name = artist.get(
+            "artistName",
+            text,
         )
-        if artist_tracks:
-            await status.edit_text(
-                format_search_results_text(artist_tracks, artist_name),
-                parse_mode="HTML",
-                reply_markup=search_result_keyboard(artist_tracks),
+
+        tracks = (
+            await fetch_itunes_info(
+                artist_name,
+                entity="song",
+                limit=8,
             )
+        )
+
+        if tracks:
+
+            keyboard = artist_keyboard(
+                artist_name,
+                tracks,
+            )
+
+            await status.edit_text(
+                f"👤 <b>{escape(artist_name)}</b>\n\n"
+                "Выбери трек:",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+
             return
 
     # ========================================================
-    # ЕСЛИ НИЧЕГО НЕ НАШЛИ
+    # ОБЫЧНЫЙ ПОИСК ТРЕКА
     # ========================================================
 
     await download_and_send(
