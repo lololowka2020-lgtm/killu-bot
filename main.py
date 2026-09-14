@@ -273,44 +273,24 @@ def song_info_keyboard(
 # ============================================================
 
 def search_result_keyboard(tracks: list):
-    """Красивый выбор результатов: название + исполнитель + альбом + длительность."""
+    """Мрачный минималистичный выбор результатов: данные трека остаются прежними."""
     buttons = []
-
     for index, track in enumerate(tracks[:8], 1):
         track_name = str(track.get("trackName") or "Неизвестный трек").strip()
         artist = str(track.get("artistName") or "Неизвестный исполнитель").strip()
         album = str(track.get("collectionName") or "").strip()
-
         ms = track.get("trackTimeMillis")
         duration = format_duration(ms / 1000) if ms else "—"
-
-        # Две строки в кнопке: пользователь сразу видит, кто исполняет песню.
-        first = f"{index}. 🎵 {track_name}"
-        second = f"👤 {artist}"
+        first = f"▸ {index:02d}  {track_name}"
+        details = artist
         if album:
-            second += f" · 💿 {album}"
+            details += f"  ·  {album}"
         if duration != "—":
-            second += f" · {duration}"
-
-        label = f"{first[:40]}\n{second[:40]}"
-        label = label[:64]
-
-        key = save_callback(
-            {
-                "type": "download",
-                "query": f"{artist} - {track_name}",
-            }
-        )
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=label,
-                callback_data=f"download:{key}",
-            )
-        ])
-
+            details += f"  ·  {duration}"
+        label = f"{first[:42]}\\n└ {details[:45]}"
+        key = save_callback({"type": "download", "query": f"{artist} - {track_name}"})
+        buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"download:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 def artist_keyboard(artist_name: str, tracks: list):
     """Совместимость со старым обработчиком."""
@@ -387,26 +367,20 @@ def format_duration(seconds):
 
 
 def url_choice_keyboard(items: list):
+    """Мрачный выбор треков по ссылке."""
     buttons = []
     for index, item in enumerate(items[:10], 1):
         title = str(item.get("title") or "Без названия")
+        artist = str(item.get("artist") or item.get("creator") or item.get("uploader") or "Неизвестный исполнитель").strip()
         duration = format_duration(item.get("duration"))
-        label = f"🎵 {index}. {title[:42]}"
+        first = f"▸ {index:02d}  {title}"
+        second = artist
         if duration != "—":
-            label += f" · {duration}"
-        key = save_callback({
-            "type": "url_download",
-            "url": item.get("url"),
-            "title": title,
-        })
-        buttons.append([
-            InlineKeyboardButton(
-                text=label[:64],
-                callback_data=f"urlpick:{key}",
-            )
-        ])
+            second += f"  ·  {duration}"
+        label = f"{first[:42]}\\n└ {second[:45]}"
+        key = save_callback({"type": "url_download", "url": item.get("url"), "title": title})
+        buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"urlpick:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 def _search_full_version_sync(title: str, artist: str):
     """Ищет полноценные версии короткого источника на YouTube."""
@@ -606,17 +580,20 @@ def variant_display_name(title: str) -> str:
 
 
 def variants_keyboard(items: list):
+    """Мрачный, но чистый список вариантов."""
     buttons = []
     for index, item in enumerate(items[:8], 1):
         title = str(item.get("title") or "Без названия")
+        artist = str(item.get("artist") or item.get("creator") or item.get("uploader") or "").strip()
         duration = format_duration(item.get("duration"))
-        label = f"{variant_display_name(title)} · {index}"
+        variant = variant_display_name(title)
+        second = artist
         if duration != "—":
-            label += f" · {duration}"
+            second += f"  ·  {duration}" if second else duration
+        label = f"▸ {index:02d}  {variant}\\n└ {second[:45]}"
         key = save_callback({"type": "url_download", "url": item.get("url"), "title": title})
         buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"urlpick:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 def download_thumbnail_sync(url: str, unique_id: str):
     """Скачивает обложку и делает JPEG до 320x320 и 200 КБ."""
@@ -639,8 +616,8 @@ def download_thumbnail_sync(url: str, unique_id: str):
             from PIL import ImageEnhance, ImageFilter, ImageDraw
             import random
 
-            image = ImageEnhance.Contrast(image).enhance(1.12)
-            image = ImageEnhance.Brightness(image).enhance(0.70)
+            image = ImageEnhance.Contrast(image).enhance(1.16)
+            image = ImageEnhance.Brightness(image).enhance(0.62)
             image = ImageEnhance.Color(image).enhance(0.82)
             image = image.convert("RGBA")
             w, h = image.size
@@ -650,8 +627,8 @@ def download_thumbnail_sync(url: str, unique_id: str):
             image = Image.alpha_composite(image, overlay)
 
             # Едва заметный холодный/красный тон по краям.
-            tint = Image.new("RGBA", image.size, (90, 0, 12, 0))
-            tint.putalpha(24)
+            tint = Image.new("RGBA", image.size, (55, 0, 8, 0))
+            tint.putalpha(18)
             image = Image.alpha_composite(image, tint)
 
             # Виньетка.
@@ -677,8 +654,8 @@ def download_thumbnail_sync(url: str, unique_id: str):
 
             # Тонкая красная рамка/акцент.
             draw = ImageDraw.Draw(image)
-            draw.rectangle((2, 2, w - 3, h - 3), outline=(115, 0, 15, 125), width=2)
-            draw.line((0, h - 3, w, h - 3), fill=(135, 0, 18, 165), width=2)
+            draw.rectangle((2, 2, w - 3, h - 3), outline=(80, 0, 10, 90), width=1)
+            draw.line((0, h - 2, w, h - 2), fill=(95, 0, 12, 105), width=1)
 
             image.convert("RGB").save(path, "JPEG", quality=78, optimize=True)
         try: os.remove(raw)
