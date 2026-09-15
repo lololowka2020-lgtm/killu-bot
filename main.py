@@ -27,7 +27,7 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("8885224113:AAHgRCgSAkzfnps6K5rSViMusb4aSO0InpU")
 
 if not BOT_TOKEN:
     raise RuntimeError(
