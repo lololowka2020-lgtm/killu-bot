@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import html
 import logging
 import os
@@ -138,6 +139,9 @@ def clean_title(title: str) -> str:
         title,
     )
 
+    # Убираем хэштеги и служебные обрезки (#shorts, #tiktok и т.п.)
+    title = re.sub(r"#\w+", " ", title)
+
     title = re.sub(r"\s+", " ", title)
     title = re.sub(r"\s+([)\]])", r"\1", title)
     title = re.sub(r"([(\[])[ ]+", r"\1", title)
@@ -154,6 +158,166 @@ def is_url(text: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+# ============================================================
+# ПОДБОР ЛУЧШЕГО СОВПАДЕНИЯ (АНТИ-ПРОМАХ)
+#
+# Раньше бот брал ПЕРВЫЙ результат поиска YouTube не глядя.
+# Из-за этого при неоднозначных запросах скачивался чужой
+# трек / обрывок / кавер. Теперь берём несколько кандидатов
+# и оцениваем, какой из них реально похож на запрос.
+# ============================================================
+
+def normalize_for_match(text: str) -> str:
+    text = str(text or "").lower()
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def score_candidate(
+    query: str,
+    candidate: dict,
+    prefer_min_duration: int = 90,
+) -> float:
+    """
+    Считает, насколько кандидат похож на запрос.
+    Учитывает: схожесть текста, вхождение всех слов запроса,
+    и штрафует слишком короткие ролики (обрывки/шортсы).
+    """
+    q_norm = normalize_for_match(query)
+
+    title_norm = normalize_for_match(candidate.get("title") or "")
+    artist_norm = normalize_for_match(candidate.get("artist") or "")
+    combined_norm = normalize_for_match(
+        f"{candidate.get('artist', '')} {candidate.get('title', '')}"
+    )
+
+    title_score = difflib.SequenceMatcher(None, q_norm, title_norm).ratio()
+    combined_score = difflib.SequenceMatcher(None, q_norm, combined_norm).ratio()
+
+    score = max(title_score, combined_score)
+
+    # Бонус, если все слова запроса нашлись у кандидата.
+    q_words = set(q_norm.split())
+    cand_words = set((title_norm + " " + artist_norm).split())
+    if q_words and q_words.issubset(cand_words):
+        score += 0.15
+
+    try:
+        duration = int(candidate.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+
+    if duration and duration < prefer_min_duration:
+        # Похоже на обрывок/шортс/тизер — сильный штраф.
+        score -= 0.4
+    elif duration and duration > 7 * 60:
+        # Слишком длинное (микс/подборка) — небольшой штраф.
+        score -= 0.05
+
+    return score
+
+
+def rank_candidates(
+    query: str,
+    candidates: list,
+    prefer_min_duration: int = 90,
+) -> list:
+    scored = [
+        (score_candidate(query, c, prefer_min_duration), c)
+        for c in candidates
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [c for _, c in scored]
+
+
+def looks_like_short_clip(url: str, duration) -> bool:
+    """Определяет обрывок не только по длительности, но и по типу ссылки."""
+    url_l = str(url or "").lower()
+
+    if any(
+        marker in url_l
+        for marker in (
+            "/shorts/",
+            "/clip/",
+            "tiktok.com",
+            "instagram.com/reel",
+            "instagram.com/p/",
+        )
+    ):
+        return True
+
+    try:
+        duration = int(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0
+
+    return bool(duration and duration < 120)
+
+
+def search_candidates_sync(query: str, count: int = 10) -> list:
+    """Быстрый (без скачивания) поиск нескольких кандидатов на YouTube."""
+    query = str(query or "").strip()
+    if not query:
+        return []
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extract_flat": True,
+        "playlistend": count,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0 Safari/537.36"
+            )
+        },
+    }
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+
+    results = []
+    for entry in (info.get("entries") or []):
+        if not entry:
+            continue
+
+        try:
+            duration = int(entry.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+
+        item_url = entry.get("webpage_url") or entry.get("original_url")
+        if not item_url and entry.get("id"):
+            item_url = f"https://www.youtube.com/watch?v={entry['id']}"
+        if not item_url:
+            continue
+
+        results.append({
+            "url": item_url,
+            "title": entry.get("title") or query,
+            "artist": (
+                entry.get("artist")
+                or entry.get("uploader")
+                or entry.get("channel")
+                or ""
+            ),
+            "duration": duration,
+        })
+
+    unique = []
+    seen = set()
+    for item in results:
+        if item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        unique.append(item)
+
+    return unique
 
 
 # ============================================================
@@ -387,75 +551,28 @@ def url_choice_keyboard(items: list):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _search_full_version_sync(title: str, artist: str):
-    """Ищет полноценные версии короткого источника на YouTube."""
-    title = str(title or "").strip()
+def _search_full_version_sync(title: str, artist: str, min_duration: int = 120):
+    """
+    Ищет полноценные версии короткого источника (обрывка/шортса) на YouTube.
+    Название сначала чистится от мусора (эмодзи, хэштеги, "official video"
+    и т.п.), иначе поиск получает грязный запрос и находит что попало.
+    Результаты ранжируются по схожести, а не берётся первый попавшийся.
+    """
+    title = clean_title(title)
     artist = str(artist or "").strip()
     query = " ".join(x for x in (artist, title) if x)
     if not query:
         return []
 
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "extract_flat": True,
-        "playlistend": 10,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0 Safari/537.36"
-            )
-        },
-    }
+    candidates = search_candidates_sync(query, count=10)
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(
-            f"ytsearch10:{query}",
-            download=False,
-        )
+    # Отбрасываем то, что явно короче обычной песни.
+    candidates = [
+        c for c in candidates
+        if not c.get("duration") or c["duration"] >= min_duration
+    ]
 
-    results = []
-    for entry in (info.get("entries") or []):
-        if not entry:
-            continue
-        try:
-            duration = int(entry.get("duration") or 0)
-        except (TypeError, ValueError):
-            duration = 0
-        # Отбрасываем Shorts/тизеры/обрывки. Обычная песня обычно > 2 минут.
-        if duration and duration < 120:
-            continue
-
-        item_url = entry.get("webpage_url") or entry.get("original_url")
-        if not item_url and entry.get("id"):
-            item_url = f"https://www.youtube.com/watch?v={entry['id']}"
-        if not item_url:
-            continue
-
-        results.append({
-            "url": item_url,
-            "title": entry.get("title") or title,
-            "artist": (
-                entry.get("artist")
-                or entry.get("uploader")
-                or entry.get("channel")
-                or artist
-                or "Неизвестный исполнитель"
-            ),
-            "duration": duration,
-        })
-
-    # Убираем дубли по URL.
-    unique = []
-    seen = set()
-    for item in results:
-        if item["url"] in seen:
-            continue
-        seen.add(item["url"])
-        unique.append(item)
-    return unique
+    return rank_candidates(query, candidates, prefer_min_duration=min_duration)
 
 
 def extract_url_choices_sync(url: str):
@@ -512,20 +629,17 @@ def extract_url_choices_sync(url: str):
             "duration": exact_info.get("duration"),
         }
 
-        try:
-            source_duration = int(exact_item.get("duration") or 0)
-        except (TypeError, ValueError):
-            source_duration = 0
-
-        # Короткие ссылки (TikTok/Shorts/тизеры) автоматически заменяем
-        # на полноценный трек. Остальное скачиваем напрямую.
-        if source_duration and source_duration < 120:
+        # Короткие ссылки (TikTok/Shorts/Reels/тизеры) автоматически заменяем
+        # на полноценный трек. Определяем это не только по длительности,
+        # но и по типу самой ссылки. Остальное скачиваем напрямую.
+        if looks_like_short_clip(exact_url, exact_item.get("duration")):
             full_versions = _search_full_version_sync(
                 exact_item["title"], exact_item["artist"]
             )
             if full_versions:
                 return {
                     "source": exact_item,
+                    # Уже отранжировано: первый элемент — лучшее совпадение.
                     "full_versions": full_versions[:8],
                 }
 
@@ -677,14 +791,15 @@ def download_thumbnail_sync(url: str, unique_id: str):
 
 
 async def show_url_choices(status_message: Message, url: str):
-    """Без превью: сразу скачивает лучший полный вариант."""
+    """Без превью: сразу скачивает лучший (наиболее похожий) полный вариант."""
     try:
         result = await asyncio.to_thread(extract_url_choices_sync, url)
         source = result.get("source")
         versions = result.get("full_versions") or []
 
         if source:
-            # Для короткой ссылки берём лучший полноценный результат сразу.
+            # versions уже отранжированы — берём наиболее похожее совпадение,
+            # а не первое, что нашлось.
             download_url = versions[0]["url"] if versions else source["url"]
             await download_and_send(
                 status_message,
@@ -757,15 +872,26 @@ def download_audio_sync(
         "max_filesize": 50 * 1024 * 1024,
     }
 
+    auto_variants = []
+
     if is_url(query):
 
-        download_query = query
+        download_target = query
 
     else:
 
-        download_query = (
-            f"ytsearch1:{query}"
-        )
+        # Раньше здесь было "ytsearch1:query" — брался первый результат
+        # не глядя, из-за чего часто прилетал не тот трек/исполнитель.
+        # Теперь ищем несколько кандидатов и выбираем наиболее похожий.
+        candidates = search_candidates_sync(query, count=10)
+        ranked = rank_candidates(query, candidates, prefer_min_duration=90)
+
+        if not ranked:
+            raise RuntimeError("Ничего не найдено.")
+
+        download_target = ranked[0]["url"]
+        # Остальные хорошие совпадения (remix/slowed/live и т.п.) — как варианты.
+        auto_variants = ranked[:8]
 
     try:
 
@@ -774,7 +900,7 @@ def download_audio_sync(
         ) as ydl:
 
             info = ydl.extract_info(
-                download_query,
+                download_target,
                 download=True,
             )
 
@@ -845,6 +971,7 @@ def download_audio_sync(
                 file_path,
                 title,
                 info,
+                auto_variants,
             )
 
     except Exception:
@@ -898,10 +1025,16 @@ async def download_and_send(
             file_path,
             title,
             info,
+            auto_variants,
         ) = await asyncio.to_thread(
             download_audio_sync,
             query,
         )
+
+        # Если варианты не передали явно (например, при скачивании по
+        # точной ссылке из кнопки) — используем то, что нашли автоматически
+        # при текстовом поиске.
+        final_variants = variants if variants else auto_variants
 
         clean_name = clean_title(
             title
@@ -958,7 +1091,7 @@ async def download_and_send(
                 str(performer),
                 clean_name,
                 source_url=(info.get("webpage_url") if is_url(query) else None),
-                variants=variants,
+                variants=final_variants,
             ),
         )
 
@@ -1200,11 +1333,36 @@ async def handle_text(
 
     # ========================================================
     # ОБЫЧНЫЙ ПОИСК ТРЕКА
+    #
+    # Раньше сюда шёл сырой текст пользователя напрямую в YouTube-поиск.
+    # Если запрос был неоднозначным ("Иван Иванов Огонь" и т.п.), это
+    # часто находило не того исполнителя. Теперь сначала пробуем найти
+    # трек в iTunes (как song, не только как artist) и, если получилось,
+    # ищем на YouTube уже по каноничным "исполнитель + название" —
+    # это заметно снижает число промахов.
     # ========================================================
+
+    search_query = text
+
+    song_results = await fetch_itunes_info(
+        text,
+        entity="song",
+        limit=1,
+    )
+
+    if song_results:
+
+        song = song_results[0]
+
+        canonical_artist = song.get("artistName", "")
+        canonical_track = song.get("trackName", "")
+
+        if canonical_artist and canonical_track:
+            search_query = f"{canonical_artist} {canonical_track}"
 
     await download_and_send(
         status,
-        text,
+        search_query,
         status_message=status,
     )
 
