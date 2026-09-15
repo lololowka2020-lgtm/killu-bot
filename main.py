@@ -27,7 +27,7 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ============================================================
 
-BOT_TOKEN = os.getenv("8885224113:AAHgRCgSAkzfnps6K5rSViMusb4aSO0InpU")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError(
@@ -76,6 +76,9 @@ callback_data_store = {}
 # ============================================================
 
 last_bot_messages = {}
+
+# Режим следующего запроса пользователя.
+user_modes = {}
 
 
 async def remember_bot_message(
@@ -527,6 +530,29 @@ def format_duration(seconds):
 
     return f"{minutes}:{seconds:02d}"
 
+
+
+def search_results_keyboard(items: list):
+    """Компактный список максимум из 8 результатов."""
+    buttons = []
+    for index, item in enumerate(items[:8], 1):
+        title = clean_title(item.get("title") or "Без названия")
+        artist = str(item.get("artist") or "").strip()
+        duration = format_duration(item.get("duration"))
+        line1 = f"{index:02d}  {title}"
+        line2 = artist or "Неизвестный исполнитель"
+        if duration != "—":
+            line2 += f"  ·  {duration}"
+        label = f"{line1[:38]}\\n{line2[:38]}"
+        key = save_callback({
+            "type": "download",
+            "query": item.get("url"),
+            "title": title,
+        })
+        buttons.append([InlineKeyboardButton(
+            text=label[:64], callback_data=f"download:{key}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def url_choice_keyboard(items: list):
@@ -1196,28 +1222,34 @@ async def download_and_send(
 async def cmd_start(
     message: Message,
 ):
+    await delete_old_bot_messages(message.chat.id)
+    user_modes[message.from_user.id] = "song"
 
-    # Удаляем старые сообщения бота,
-    # но не музыку.
-
-    await delete_old_bot_messages(
-        message.chat.id
-    )
-
-    user_name = (
-        message.from_user.first_name
-        if message.from_user
-        else "Ник"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎧  Найти трек", callback_data="mode:song")],
+            [InlineKeyboardButton(text="👤  Найти исполнителя", callback_data="mode:artist")],
+        ]
     )
 
     welcome = await message.answer(
-        f"Привет, <b>{escape(user_name)}</b> 👋",
-        parse_mode="HTML",
+        "Привествую, мед 🖤\\n\\n"
+        "Выбери режим или просто отправь название песни.",
+        reply_markup=keyboard,
     )
+    await remember_bot_message(welcome)
 
-    await remember_bot_message(
-        welcome
+
+@dp.callback_query(F.data.startswith("mode:"))
+async def choose_mode(callback: CallbackQuery):
+    mode = callback.data.split(":", 1)[1]
+    user_modes[callback.from_user.id] = mode
+    await callback.answer()
+    msg = await callback.message.answer(
+        "👤 Напиши имя исполнителя." if mode == "artist"
+        else "🎧 Напиши название песни или исполнителя."
     )
+    await remember_bot_message(msg)
 
 
 # ============================================================
@@ -1287,84 +1319,37 @@ async def handle_text(
     )
 
     # ========================================================
-    # ИЩЕМ ИСПОЛНИТЕЛЯ
-    # ========================================================
+    # ПОИСК РЕЗУЛЬТАТОВ
+    user_id = message.from_user.id
+    mode = user_modes.get(user_id, "song")
 
-    artist_results = (
-        await fetch_itunes_info(
-            text,
-            entity="musicArtist",
-            limit=1,
-        )
+    if mode == "artist":
+        artist_results = await fetch_itunes_info(text, entity="musicArtist", limit=1)
+        if artist_results:
+            artist_name = artist_results[0].get("artistName", text)
+            tracks = await fetch_itunes_info(artist_name, entity="song", limit=8)
+            if tracks:
+                await status.edit_text(
+                    f"👤 <b>{escape(artist_name)}</b>\\n\\nВыбери трек:",
+                    parse_mode="HTML",
+                    reply_markup=artist_keyboard(artist_name, tracks),
+                )
+                return
+
+    # Обычный поиск: показываем до 8 вариантов и ждём выбора.
+    candidates = await asyncio.to_thread(search_candidates_sync, text, 8)
+    ranked = rank_candidates(text, candidates, prefer_min_duration=90)
+
+    if not ranked:
+        await status.edit_text("😔 Ничего не найдено.")
+        return
+
+    await status.edit_text(
+        "🎧 <b>Результаты поиска</b>\\n<i>Выбери нужный трек:</i>",
+        parse_mode="HTML",
+        reply_markup=search_results_keyboard(ranked[:8]),
     )
 
-    if artist_results:
-
-        artist = artist_results[0]
-
-        artist_name = artist.get(
-            "artistName",
-            text,
-        )
-
-        tracks = (
-            await fetch_itunes_info(
-                artist_name,
-                entity="song",
-                limit=8,
-            )
-        )
-
-        if tracks:
-
-            keyboard = artist_keyboard(
-                artist_name,
-                tracks,
-            )
-
-            await status.edit_text(
-                f"👤 <b>{escape(artist_name)}</b>\n\n"
-                "Выбери трек:",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-
-            return
-
-    # ========================================================
-    # ОБЫЧНЫЙ ПОИСК ТРЕКА
-    #
-    # Раньше сюда шёл сырой текст пользователя напрямую в YouTube-поиск.
-    # Если запрос был неоднозначным ("Иван Иванов Огонь" и т.п.), это
-    # часто находило не того исполнителя. Теперь сначала пробуем найти
-    # трек в iTunes (как song, не только как artist) и, если получилось,
-    # ищем на YouTube уже по каноничным "исполнитель + название" —
-    # это заметно снижает число промахов.
-    # ========================================================
-
-    search_query = text
-
-    song_results = await fetch_itunes_info(
-        text,
-        entity="song",
-        limit=1,
-    )
-
-    if song_results:
-
-        song = song_results[0]
-
-        canonical_artist = song.get("artistName", "")
-        canonical_track = song.get("trackName", "")
-
-        if canonical_artist and canonical_track:
-            search_query = f"{canonical_artist} {canonical_track}"
-
-    await download_and_send(
-        status,
-        search_query,
-        status_message=status,
-    )
 
 
 # ============================================================
