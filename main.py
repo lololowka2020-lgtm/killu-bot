@@ -1009,210 +1009,161 @@ async def show_url_choices(status_message: Message, url: str):
 # СКАЧИВАНИЕ БЕЗ FFMPEG
 # ============================================================
 
-def download_audio_sync(
-    query: str,
-):
+def download_audio_sync(query: str):
+    """Надёжно скачивает выбранный трек.
 
+    Важно: сначала пробуем именно URL выбранной кнопки. Если YouTube
+    блокирует конкретный формат/клиент, пробуем несколько клиентов и
+    затем резервный поиск по названию.
+    """
     unique_id = uuid.uuid4().hex
+    output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
 
-    output_template = os.path.join(
-        DOWNLOAD_DIR,
-        f"{unique_id}.%(ext)s",
-    )
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-
-        "outtmpl": output_template,
-
-        "noplaylist": True,
-
-        "quiet": True,
-
-        "no_warnings": True,
-
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/140.0 Safari/537.36"
-            )
-        },
-
-        "max_filesize": 50 * 1024 * 1024,
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 3,
-        "socket_timeout": 30,
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36"
+        )
     }
 
+    def make_opts(client=None):
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": headers,
+            "max_filesize": 50 * 1024 * 1024,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 3,
+            "file_access_retries": 3,
+            "socket_timeout": 30,
+            "ignoreerrors": False,
+        }
+        if client:
+            opts["extractor_args"] = {
+                "youtube": {"player_client": [client]}
+            }
+        return opts
+
     auto_variants = []
+    download_target = query
 
-    if is_url(query):
-
-        download_target = query
-
-    else:
-
-        # Раньше здесь было "ytsearch1:query" — брался первый результат
-        # не глядя, из-за чего часто прилетал не тот трек/исполнитель.
-        # Теперь ищем несколько кандидатов и выбираем наиболее похожий.
-        candidates = search_candidates_sync(query, count=10)
+    # Для текстового запроса выбираем лучший результат поиска.
+    if not is_url(query):
+        candidates = search_candidates_sync(query, count=12)
         ranked = rank_candidates(query, candidates, prefer_min_duration=90)
-
         if not ranked:
             raise RuntimeError("Ничего не найдено.")
-
         download_target = ranked[0]["url"]
-        # Остальные хорошие совпадения (remix/slowed/live и т.п.) — как варианты.
         auto_variants = ranked[:8]
 
-    try:
+    info = None
+    file_path = None
+    last_error = None
 
-        # Сначала пробуем скачать именно выбранный URL.
-        # Если источник временно не отдаёт файл, не показываем пользователю
-        # ложное "трек не найден": делаем резервный поиск по названию.
+    # Несколько вариантов клиента YouTube. Это особенно важно сейчас:
+    # yt-dlp документирует изменения с PO Token и доступностью форматов.
+    clients = ["android_vr", "web_embedded", None]
+    for client in clients:
         try:
-            with yt_dlp.YoutubeDL(
-                ydl_opts
-            ) as ydl:
-                info = ydl.extract_info(
-                    download_target,
-                    download=True,
-                )
-        except Exception as direct_error:
-            if is_url(query):
-                fallback_title = ""
-                try:
-                    with yt_dlp.YoutubeDL({
-                        "quiet": True,
-                        "no_warnings": True,
-                        "noplaylist": True,
-                        "skip_download": True,
-                        "http_headers": ydl_opts["http_headers"],
-                    }) as meta_ydl:
-                        meta = meta_ydl.extract_info(query, download=False)
-                        if meta:
-                            fallback_title = " ".join(
-                                x for x in (
-                                    meta.get("artist"),
-                                    meta.get("creator"),
-                                    meta.get("title"),
-                                ) if x
-                            )
-                except Exception:
-                    pass
+            with yt_dlp.YoutubeDL(make_opts(client)) as ydl:
+                info = ydl.extract_info(download_target, download=True)
+            if info:
+                break
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Не удалось скачать %s через client=%s: %s",
+                download_target, client, exc
+            )
 
-                if fallback_title:
-                    fallback_candidates = search_candidates_sync(fallback_title, count=12)
-                    fallback_ranked = rank_candidates(fallback_title, fallback_candidates, prefer_min_duration=90)
-                    if fallback_ranked:
-                        download_target = fallback_ranked[0]["url"]
-                        auto_variants = fallback_ranked[:8]
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            info = ydl.extract_info(download_target, download=True)
-                    else:
-                        raise direct_error
-                else:
-                    raise direct_error
-            else:
-                raise direct_error
-
-            if not info:
-
-                raise RuntimeError(
-                    "Ничего не найдено."
-                )
-
-            if "entries" in info:
-
-                entries = info.get(
-                    "entries"
-                )
-
-                if not entries:
-
-                    raise RuntimeError(
-                        "Ничего не найдено."
+    # Если выбранный URL не скачался, пытаемся найти тот же трек по метаданным.
+    if not info and is_url(query):
+        fallback_title = ""
+        try:
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "http_headers": headers,
+            }) as meta_ydl:
+                meta = meta_ydl.extract_info(query, download=False)
+                if meta:
+                    fallback_title = " ".join(
+                        x for x in (
+                            meta.get("artist"),
+                            meta.get("creator"),
+                            meta.get("track"),
+                            meta.get("title"),
+                        ) if x
                     )
+        except Exception as exc:
+            logger.warning("Не удалось получить метаданные URL: %s", exc)
 
-                info = entries[0]
-
-            title = info.get(
-                "title",
-                "Неизвестный трек",
+        if fallback_title:
+            fallback_candidates = search_candidates_sync(fallback_title, count=12)
+            fallback_ranked = rank_candidates(
+                fallback_title, fallback_candidates, prefer_min_duration=90
             )
+            for candidate in fallback_ranked[:8]:
+                for client in clients:
+                    try:
+                        with yt_dlp.YoutubeDL(make_opts(client)) as ydl:
+                            info = ydl.extract_info(candidate["url"], download=True)
+                        if info:
+                            download_target = candidate["url"]
+                            auto_variants = fallback_ranked[:8]
+                            break
+                    except Exception as exc:
+                        last_error = exc
+                if info:
+                    break
 
-            file_path = ydl.prepare_filename(
-                info
-            )
+    if not info:
+        raise RuntimeError(
+            f"Не удалось скачать выбранный трек. Последняя ошибка: {last_error}"
+        )
 
-            # Иногда расширение файла отличается.
-            if not os.path.exists(
-                file_path
-            ):
+    if "entries" in info:
+        entries = info.get("entries") or []
+        if not entries:
+            raise RuntimeError("YouTube не вернул файл трека.")
+        info = entries[0]
 
-                base = os.path.splitext(
-                    file_path
-                )[0]
+    title = info.get("title") or "Неизвестный трек"
 
-                for filename in os.listdir(
-                    DOWNLOAD_DIR
-                ):
-
-                    full_path = os.path.join(
-                        DOWNLOAD_DIR,
-                        filename,
-                    )
-
-                    if filename.startswith(
-                        os.path.basename(base)
-                    ):
-
-                        file_path = full_path
-
-                        break
-
-            if not os.path.exists(
-                file_path
-            ):
-
-                raise FileNotFoundError(
-                    "Скачанный файл не найден."
-                )
-
-            return (
-                file_path,
-                title,
-                info,
-                auto_variants,
-            )
-
+    # Ищем фактически созданный файл, не полагаясь только на расширение.
+    possible = []
+    try:
+        prepared = yt_dlp.YoutubeDL(make_opts()).prepare_filename(info)
+        possible.append(prepared)
     except Exception:
+        pass
 
-        for filename in os.listdir(
-            DOWNLOAD_DIR
-        ):
+    for candidate_path in possible:
+        if os.path.exists(candidate_path):
+            file_path = candidate_path
+            break
 
-            if filename.startswith(
-                unique_id
-            ):
+    if not file_path:
+        prefix = unique_id
+        for filename in os.listdir(DOWNLOAD_DIR):
+            if filename.startswith(prefix):
+                candidate_path = os.path.join(DOWNLOAD_DIR, filename)
+                if os.path.isfile(candidate_path):
+                    file_path = candidate_path
+                    break
 
-                try:
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError("yt-dlp сообщил об успехе, но файл не найден.")
 
-                    os.remove(
-                        os.path.join(
-                            DOWNLOAD_DIR,
-                            filename,
-                        )
-                    )
+    return file_path, title, info, auto_variants
 
-                except OSError:
-                    pass
-
-        raise
 
 
 # ============================================================
