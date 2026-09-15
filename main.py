@@ -260,7 +260,7 @@ def looks_like_short_clip(url: str, duration) -> bool:
     return bool(duration and duration < 120)
 
 
-def search_candidates_sync(query: str, count: int = 10) -> list:
+def search_candidates_sync(query: str, count: int = 48) -> list:
     """Быстрый (без скачивания) поиск нескольких кандидатов на YouTube."""
     query = str(query or "").strip()
     if not query:
@@ -532,28 +532,68 @@ def format_duration(seconds):
 
 
 
-def search_results_keyboard(items: list):
-    """Компактный список максимум из 8 результатов."""
+def search_results_keyboard(items: list, page: int = 0):
+    """Постраничный список результатов: по 8 треков на страницу."""
+    per_page = 8
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    visible = items[start:start + per_page]
+
     buttons = []
-    for index, item in enumerate(items[:8], 1):
+    for local_index, item in enumerate(visible, start + 1):
         title = clean_title(item.get("title") or "Без названия")
         artist = str(item.get("artist") or "").strip()
         duration = format_duration(item.get("duration"))
-        line1 = f"{index:02d}  {title}"
+
+        # Более аккуратный двухстрочный дизайн.
+        line1 = f"{local_index:02d}  {title}"
         line2 = artist or "Неизвестный исполнитель"
         if duration != "—":
             line2 += f"  ·  {duration}"
-        label = f"{line1[:38]}\\n{line2[:38]}"
+
         key = save_callback({
             "type": "download",
             "query": item.get("url"),
             "title": title,
         })
         buttons.append([InlineKeyboardButton(
-            text=label[:64], callback_data=f"download:{key}"
+            text=f"{line1[:38]}\n{line2[:38]}",
+            callback_data=f"download:{key}"
         )])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+    # Навигация появляется только если результатов больше одной страницы.
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            prev_key = save_callback({"type": "search_page", "items": items, "page": page - 1})
+            nav.append(InlineKeyboardButton(text="‹", callback_data=f"page:{prev_key}"))
+
+        # Небольшой ряд номеров страниц. Показываем максимум 5 кнопок.
+        page_window = list(range(total_pages))
+        if total_pages > 5:
+            left = max(0, min(page - 2, total_pages - 5))
+            page_window = list(range(left, left + 5))
+        for pno in page_window:
+            pkey = save_callback({"type": "search_page", "items": items, "page": pno})
+            text = f"· {pno + 1} ·" if pno == page else str(pno + 1)
+            nav.append(InlineKeyboardButton(text=text, callback_data=f"page:{pkey}"))
+
+        if page < total_pages - 1:
+            next_key = save_callback({"type": "search_page", "items": items, "page": page + 1})
+            nav.append(InlineKeyboardButton(text="›", callback_data=f"page:{next_key}"))
+
+        buttons.append(nav)
+
+    # Небольшая служебная строка вместо перегруженных кнопок.
+    if total_pages > 1:
+        info_key = save_callback({"type": "search_page", "items": items, "page": page})
+        buttons.append([InlineKeyboardButton(
+            text=f"📄 Страница {page + 1} из {total_pages} · всего {len(items)}",
+            callback_data=f"page:{info_key}"
+        )])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def url_choice_keyboard(items: list):
     buttons = []
@@ -949,7 +989,7 @@ async def show_url_choices(status_message: Message, url: str):
             raise RuntimeError("По ссылке ничего не найдено.")
 
         await status_message.edit_text(
-            "🎧 <b>Нашёл варианты</b>\n<i>Выбери нужный трек:</i>",
+            "╭─ 🔎 <b>НАЙДЕННЫЕ ТРЕКИ</b>\n╰─ <i>Выбери подходящий вариант</i>",
             parse_mode="HTML",
             reply_markup=search_results_keyboard(items),
         )
@@ -1002,6 +1042,10 @@ def download_audio_sync(
         },
 
         "max_filesize": 50 * 1024 * 1024,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
     }
 
     auto_variants = []
@@ -1027,14 +1071,54 @@ def download_audio_sync(
 
     try:
 
-        with yt_dlp.YoutubeDL(
-            ydl_opts
-        ) as ydl:
+        # Сначала пробуем скачать именно выбранный URL.
+        # Если источник временно не отдаёт файл, не показываем пользователю
+        # ложное "трек не найден": делаем резервный поиск по названию.
+        try:
+            with yt_dlp.YoutubeDL(
+                ydl_opts
+            ) as ydl:
+                info = ydl.extract_info(
+                    download_target,
+                    download=True,
+                )
+        except Exception as direct_error:
+            if is_url(query):
+                fallback_title = ""
+                try:
+                    with yt_dlp.YoutubeDL({
+                        "quiet": True,
+                        "no_warnings": True,
+                        "noplaylist": True,
+                        "skip_download": True,
+                        "http_headers": ydl_opts["http_headers"],
+                    }) as meta_ydl:
+                        meta = meta_ydl.extract_info(query, download=False)
+                        if meta:
+                            fallback_title = " ".join(
+                                x for x in (
+                                    meta.get("artist"),
+                                    meta.get("creator"),
+                                    meta.get("title"),
+                                ) if x
+                            )
+                except Exception:
+                    pass
 
-            info = ydl.extract_info(
-                download_target,
-                download=True,
-            )
+                if fallback_title:
+                    fallback_candidates = search_candidates_sync(fallback_title, count=12)
+                    fallback_ranked = rank_candidates(fallback_title, fallback_candidates, prefer_min_duration=90)
+                    if fallback_ranked:
+                        download_target = fallback_ranked[0]["url"]
+                        auto_variants = fallback_ranked[:8]
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            info = ydl.extract_info(download_target, download=True)
+                    else:
+                        raise direct_error
+                else:
+                    raise direct_error
+            else:
+                raise direct_error
 
             if not info:
 
@@ -1399,7 +1483,7 @@ async def handle_text(
     if is_url(text):
 
         status = await message.answer(
-            "⏳ Загружаю полноценную версию..."
+            "⏳ Анализирую ссылку и ищу трек..."
         )
 
         await remember_bot_message(
@@ -1444,7 +1528,7 @@ async def handle_text(
                 return
 
     # Обычный поиск: показываем до 8 вариантов и ждём выбора.
-    candidates = await asyncio.to_thread(search_candidates_sync, text, 8)
+    candidates = await asyncio.to_thread(search_candidates_sync, text, 48)
     ranked = rank_candidates(text, candidates, prefer_min_duration=90)
 
     if not ranked:
@@ -1454,7 +1538,7 @@ async def handle_text(
     await status.edit_text(
         "🎧 <b>Результаты поиска</b>\\n<i>Выбери нужный трек:</i>",
         parse_mode="HTML",
-        reply_markup=search_results_keyboard(ranked[:8]),
+        reply_markup=search_results_keyboard(ranked[:48]),
     )
 
 
@@ -1535,6 +1619,32 @@ async def show_variants(
         parse_mode="HTML",
         reply_markup=variants_keyboard(items),
     )
+
+
+# ============================================================
+# ПЕРЕКЛЮЧЕНИЕ СТРАНИЦ ПОИСКА
+# ============================================================
+
+@dp.callback_query(F.data.startswith("page:"))
+async def search_page(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    data = callback_data_store.get(key)
+    if not data or data.get("type") != "search_page":
+        await callback.answer("Страница устарела.", show_alert=True)
+        return
+
+    items = data.get("items") or []
+    page = int(data.get("page") or 0)
+    total_pages = max(1, (len(items) + 7) // 8)
+    page = max(0, min(page, total_pages - 1))
+
+    await callback.answer(f"Страница {page + 1} из {total_pages}")
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=search_results_keyboard(items, page=page)
+        )
+    except Exception as e:
+        logger.warning("Не удалось переключить страницу: %s", e)
 
 
 # ============================================================
