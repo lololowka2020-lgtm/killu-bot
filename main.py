@@ -601,8 +601,71 @@ def _search_full_version_sync(title: str, artist: str, min_duration: int = 120):
     return rank_candidates(query, candidates, prefer_min_duration=min_duration)
 
 
+
+def is_tiktok_url(url: str) -> bool:
+    host = (urlparse(url).netloc or "").lower().split(":", 1)[0]
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def resolve_url_sync(url: str) -> str:
+    """Разворачивает короткую ссылку (vt.tiktok.com и т.п.) без стороннего сервиса."""
+    try:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/140.0 Safari/537.36"
+                )
+            },
+        )
+        with urlopen(req, timeout=15) as response:
+            return response.geturl() or url
+    except Exception:
+        return url
+
+
+def fetch_tiktok_oembed_sync(url: str) -> dict:
+    """Берёт публичные метаданные TikTok через официальный oEmbed."""
+    import json
+    from urllib.parse import quote
+
+    resolved = resolve_url_sync(url)
+    api_url = "https://www.tiktok.com/oembed?url=" + quote(resolved, safe="")
+    req = Request(
+        api_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0 Safari/537.36"
+            )
+        },
+    )
+    with urlopen(req, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def tiktok_music_query_from_oembed(data: dict) -> str:
+    """Пытается вытащить название звука из HTML oEmbed, затем запасной вариант — title."""
+    embed_html = str(data.get("html") or "")
+    match = re.search(r"♬\s*([^<]+)", embed_html)
+    if match:
+        sound = html.unescape(match.group(1)).strip()
+        sound = re.sub(r"\s+", " ", sound)
+        if sound and sound.lower() not in {"original sound", "оригинальный звук"}:
+            return sound
+
+    title = html.unescape(str(data.get("title") or "")).strip()
+    author = html.unescape(str(data.get("author_name") or "")).strip()
+    title = re.sub(r"#\w+", " ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return " ".join(x for x in (title, author) if x)
+
+
 def extract_url_choices_sync(url: str):
-    """Получает именно ссылку и при необходимости ищет её полную версию."""
+    """Получает ссылку и превращает её в до 8 вариантов для выбора."""
     def base_opts(noplaylist: bool):
         return {
             "quiet": True,
@@ -635,6 +698,66 @@ def extract_url_choices_sync(url: str):
             urlencode(clean_query, doseq=True), parsed.fragment,
         ))
 
+    # TikTok: сначала пытаемся получить нормальный URL и метаданные.
+    # Это важно, потому что vt.tiktok.com — короткая ссылка, а yt-dlp
+    # периодически ломается именно на TikTok extraction.
+    if is_tiktok_url(url):
+        try:
+            resolved_url = resolve_url_sync(url)
+            with yt_dlp.YoutubeDL(base_opts(True)) as ydl:
+                exact_info = ydl.extract_info(resolved_url, download=False)
+
+            if exact_info:
+                exact_item = {
+                    "url": exact_info.get("webpage_url") or resolved_url,
+                    "title": exact_info.get("title") or "TikTok",
+                    "artist": (
+                        exact_info.get("artist")
+                        or exact_info.get("creator")
+                        or exact_info.get("uploader")
+                        or exact_info.get("channel")
+                        or ""
+                    ),
+                    "duration": exact_info.get("duration"),
+                }
+                music_query = " ".join(
+                    x for x in (
+                        exact_info.get("track"),
+                        exact_info.get("artist"),
+                        exact_info.get("title"),
+                    ) if x
+                )
+            else:
+                raise RuntimeError("TikTok metadata is empty")
+        except Exception:
+            # Официальный TikTok oEmbed — fallback без стороннего сервиса.
+            data = fetch_tiktok_oembed_sync(url)
+            resolved_url = resolve_url_sync(url)
+            music_query = tiktok_music_query_from_oembed(data)
+            exact_item = {
+                "url": resolved_url,
+                "title": data.get("title") or "TikTok",
+                "artist": data.get("author_name") or "",
+                "duration": None,
+            }
+
+        # Ищем полноценные музыкальные версии по данным TikTok.
+        if music_query:
+            versions = search_candidates_sync(music_query, count=10)
+            versions = rank_candidates(
+                music_query,
+                versions,
+                prefer_min_duration=90,
+            )
+            if versions:
+                return {
+                    "source": exact_item,
+                    "full_versions": versions[:8],
+                }
+
+        return {"source": exact_item, "full_versions": []}
+
+    # Остальные URL обрабатываем обычным yt-dlp.
     with yt_dlp.YoutubeDL(base_opts(True)) as ydl:
         exact_info = ydl.extract_info(exact_url, download=False)
 
@@ -655,9 +778,6 @@ def extract_url_choices_sync(url: str):
             "duration": exact_info.get("duration"),
         }
 
-        # Короткие ссылки (TikTok/Shorts/Reels/тизеры) автоматически заменяем
-        # на полноценный трек. Определяем это не только по длительности,
-        # но и по типу самой ссылки. Остальное скачиваем напрямую.
         if looks_like_short_clip(exact_url, exact_item.get("duration")):
             full_versions = _search_full_version_sync(
                 exact_item["title"], exact_item["artist"]
@@ -665,7 +785,6 @@ def extract_url_choices_sync(url: str):
             if full_versions:
                 return {
                     "source": exact_item,
-                    # Уже отранжировано: первый элемент — лучшее совпадение.
                     "full_versions": full_versions[:8],
                 }
 
@@ -700,8 +819,7 @@ def extract_url_choices_sync(url: str):
 
     if not items:
         raise RuntimeError("В этой ссылке не найдено доступных треков.")
-    return {"source": None, "full_versions": items}
-
+    return {"source": None, "full_versions": items[:8]}
 
 def variant_display_name(title: str) -> str:
     title = str(title or "Без названия")
@@ -817,43 +935,31 @@ def download_thumbnail_sync(url: str, unique_id: str):
 
 
 async def show_url_choices(status_message: Message, url: str):
-    """Без превью: сразу скачивает лучший (наиболее похожий) полный вариант."""
+    """Для ссылки сначала показывает найденные варианты, а не скачивает первый."""
     try:
         result = await asyncio.to_thread(extract_url_choices_sync, url)
         source = result.get("source")
         versions = result.get("full_versions") or []
 
-        if source:
-            # versions уже отранжированы — берём наиболее похожее совпадение,
-            # а не первое, что нашлось.
-            download_url = versions[0]["url"] if versions else source["url"]
-            await download_and_send(
-                status_message,
-                download_url,
-                status_message=status_message,
-                variants=(versions if versions else []),
-            )
-            return
+        items = versions[:8]
+        if not items and source:
+            items = [source]
 
-        # Плейлист: не показываем предпросмотр, а сразу скачиваем первый
-        # найденный элемент и сохраняем остальные как варианты.
-        if versions:
-            await download_and_send(
-                status_message,
-                versions[0]["url"],
-                status_message=status_message,
-                variants=versions,
-            )
-            return
+        if not items:
+            raise RuntimeError("По ссылке ничего не найдено.")
 
-        raise RuntimeError("По ссылке ничего не найдено.")
+        await status_message.edit_text(
+            "🎧 <b>Нашёл варианты</b>\n<i>Выбери нужный трек:</i>",
+            parse_mode="HTML",
+            reply_markup=search_results_keyboard(items),
+        )
 
     except Exception as e:
         logger.exception("Ошибка обработки ссылки: %s", e)
         try:
             await status_message.edit_text(
-                "❌ Не удалось получить полноценный трек по этой ссылке.\n\n"
-                "Попробуй другую ссылку на тот же трек."
+                "❌ Не удалось распознать музыку по этой ссылке.\n\n"
+                "Если это TikTok, попробуй отправить ссылку ещё раз или название трека."
             )
         except Exception:
             pass
@@ -1225,19 +1331,20 @@ async def cmd_start(
     await delete_old_bot_messages(message.chat.id)
     user_modes[message.from_user.id] = "song"
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎧  Найти трек", callback_data="mode:song")],
-            [InlineKeyboardButton(text="👤  Найти исполнителя", callback_data="mode:artist")],
-        ]
+    user_name = (
+        message.from_user.first_name
+        if message.from_user
+        else "Ник"
     )
 
     welcome = await message.answer(
-        "Привествую, мед 🖤\\n\\n"
-        "Выбери режим или просто отправь название песни.",
-        reply_markup=keyboard,
+        f"Привет, <b>{escape(user_name)}</b> 👋",
+        parse_mode="HTML",
     )
-    await remember_bot_message(welcome)
+
+    await remember_bot_message(
+        welcome
+    )
 
 
 @dp.callback_query(F.data.startswith("mode:"))
